@@ -1,7 +1,9 @@
 {
   "name": "elysia-connect-middleware",
   "version": "0.0.0",
-  "module": "./dist/index.js",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "type": "module",
   "peerDependencies": {
     "elysia": "^1.4.18"
   },
@@ -10,6 +12,5 @@
     "@types/express": "^5.0.6",
     "connect": "^3.7.0",
     "node-mocks-http": "^1.17.2"
-  },
-  "type": "module"
+  }
 }
