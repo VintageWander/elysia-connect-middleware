@@ -49,7 +49,7 @@ export function connect(...middlewares: ConnectMiddleware[]) {
   });
 }
 
-export type ConnectMiddleware = (
+type ConnectMiddleware = (
   req: MockRequest<ExpressRequest>,
   res: MockResponse<ExpressResponse>,
   next: ExpressNextFunction
@@ -65,7 +65,7 @@ function mockAppAtRequest(message: MockRequest<any>, connectApp: any) {
   return message;
 }
 
-export async function transformRequestToIncomingMessage(
+async function transformRequestToIncomingMessage(
   connectApp: any,
   request: Request,
   options?: RequestOptions
@@ -101,7 +101,7 @@ export async function transformRequestToIncomingMessage(
   return mockAppAtRequest(message, connectApp);
 }
 
-export function transformResponseToServerResponse(
+function transformResponseToServerResponse(
   serverResponse: MockResponse<ServerResponse>
 ) {
   // console.log("content", serverResponse._getData(), serverResponse._getBuffer());
@@ -117,7 +117,7 @@ export function transformResponseToServerResponse(
   );
 }
 
-export function createResponse(
+function createResponse(
   request: Express.Request,
   resolve: (value: Response) => void
 ) {
