@@ -6,11 +6,5 @@
   "type": "module",
   "peerDependencies": {
     "elysia": "^1.4.18"
-  },
-  "dependencies": {
-    "connect": "^3.7.0"
-  },
-  "devDependencies": {
-    "@types/connect": "^3.4.38"
   }
 }

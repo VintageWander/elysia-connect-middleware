@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { EventEmitter } from "node:events";
-import Connect from "connect";
 import { Elysia } from "elysia";
 
 export type ConnectMiddleware = (
@@ -9,28 +8,17 @@ export type ConnectMiddleware = (
   next: (err?: any) => void,
 ) => void;
 
-interface ConnectApp {
-  use(fn: ConnectMiddleware): void;
-  handle(req: any, res: any, done: Function): void;
-}
-
 export function connect(...middlewares: ConnectMiddleware[]) {
-  const connectApp: ConnectApp = Connect();
-
-  for (const middleware of middlewares) {
-    connectApp.use(middleware);
-  }
-
   return new Elysia({
     name: "connect",
     seed: middlewares,
   }).onRequest(async function processConnectMiddlewares({ request, set }) {
-    const req = await toNodeRequest(request, connectApp);
+    const req = await toNodeRequest(request);
 
     return await new Promise<Response | undefined>((resolve) => {
       const res = createNodeResponse(req, resolve);
 
-      connectApp.handle(req, res, () => {
+      runMiddleware(middlewares, req, res, () => {
         const webResponse = toWebResponse(res);
 
         webResponse.headers.forEach((value, key) => {
@@ -44,6 +32,46 @@ export function connect(...middlewares: ConnectMiddleware[]) {
   });
 }
 
+// Minimal connect-compatible middleware runner. Walks the stack calling next()
+// to advance; dispatches error handlers (arity 4) when an error is present,
+// skips normal handlers in that case, and vice-versa.
+function runMiddleware(
+  stack: ((...args: any[]) => void)[],
+  req: unknown,
+  res: unknown,
+  done: (err?: unknown) => void,
+) {
+  let index = 0;
+
+  function next(err?: unknown) {
+    const handle = stack[index++];
+    if (!handle) {
+      done(err);
+      return;
+    }
+
+    try {
+      if (err) {
+        if (handle.length >= 4) {
+          handle(err, req, res, next);
+        } else {
+          next(err);
+        }
+      } else {
+        if (handle.length < 4) {
+          handle(req, res, next);
+        } else {
+          next();
+        }
+      }
+    } catch (e) {
+      next(e);
+    }
+  }
+
+  next();
+}
+
 function createMockSocket() {
   return Object.assign(new EventEmitter(), {
     destroy() {},
@@ -53,7 +81,7 @@ function createMockSocket() {
   });
 }
 
-async function toNodeRequest(request: Request, connectApp: ConnectApp) {
+async function toNodeRequest(request: Request) {
   const parsed = new URL(request.url, "http://localhost");
 
   const query: Record<string, string> = {};
@@ -75,12 +103,11 @@ async function toNodeRequest(request: Request, connectApp: ConnectApp) {
 
   const socket = createMockSocket();
 
-  // Prototype-inherit from connectApp so middleware can call methods like
-  // req.app.handle(), while our stub shadows the missing Express .get().
-  const app = Object.create(connectApp);
-  app.get = (_setting: string) => false;
+  // Express middleware calls req.app.get('env') to read settings.
+  // Connect has no settings system, so we stub it.
+  const app = { get: () => false };
 
-  const req = Object.assign(new EventEmitter(), {
+  return Object.assign(new EventEmitter(), {
     method: request.method.toUpperCase(),
     url: parsed.pathname + parsed.search,
     originalUrl: parsed.pathname + parsed.search,
@@ -108,21 +135,19 @@ async function toNodeRequest(request: Request, connectApp: ConnectApp) {
       return headers[name.toLowerCase()];
     },
     unpipe() {
-      return req;
+      return this;
     },
     resume() {
-      return req;
+      return this;
     },
     pause() {
-      return req;
+      return this;
     },
     destroy() {},
     setTimeout(_ms: number, _cb?: () => void) {
-      return req;
+      return this;
     },
   });
-
-  return req;
 }
 
 function concatChunks(chunks: Uint8Array[]): ArrayBuffer {
