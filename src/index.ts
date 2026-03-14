@@ -5,6 +5,8 @@ import {
   type Body as MockBody,
   createRequest,
   type MockRequest,
+  type RequestMethod,
+  type Headers as MockHeaders,
 } from "node-mocks-http";
 import { createResponse as createResponseMock } from "node-mocks-http";
 import Connect from "connect";
@@ -15,12 +17,21 @@ import type {
   NextFunction as ExpressNextFunction,
 } from "express";
 
+type ConnectServer = ReturnType<typeof Connect>;
+
+function headersToRecord(headers: globalThis.Headers): MockHeaders {
+  const record: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    record[key] = value;
+  });
+  return record as MockHeaders;
+}
+
 export function connect(...middlewares: ConnectMiddleware[]) {
   const connectApp = Connect();
 
   for (const middleware of middlewares) {
-    // @ts-expect-error
-    connectApp.use(middleware);
+    connectApp.use(middleware as unknown as Connect.HandleFunction);
   }
 
   return new Elysia({
@@ -29,7 +40,7 @@ export function connect(...middlewares: ConnectMiddleware[]) {
   }).onRequest(async function processConnectMiddlewares({ request, set }) {
     const message = await transformRequestToIncomingMessage(
       connectApp,
-      request as unknown as Request
+      request as unknown as Request,
     );
 
     return await new Promise<Response | undefined>((resolve) => {
@@ -52,23 +63,27 @@ export function connect(...middlewares: ConnectMiddleware[]) {
 type ConnectMiddleware = (
   req: MockRequest<ExpressRequest>,
   res: MockResponse<ExpressResponse>,
-  next: ExpressNextFunction
+  next: ExpressNextFunction,
 ) => unknown;
 
-function mockAppAtRequest(message: MockRequest<any>, connectApp: any) {
-  message.app = connectApp;
-
-  message.app.get = (data: string) => {
-    return false;
+function mockAppAtRequest(
+  message: MockRequest<ExpressRequest>,
+  connectApp: ConnectServer,
+) {
+  const mock = message as unknown as {
+    app: ConnectServer & { get(key: string): boolean };
   };
+  mock.app = Object.assign(connectApp, {
+    get: (_key: string) => false,
+  });
 
   return message;
 }
 
 async function transformRequestToIncomingMessage(
-  connectApp: any,
+  connectApp: ConnectServer,
   request: Request,
-  options?: RequestOptions
+  options?: RequestOptions,
 ) {
   const parsedURL = new URL(request.url, "http://localhost");
 
@@ -87,12 +102,12 @@ async function transformRequestToIncomingMessage(
   }
 
   const message = createRequest({
-    method: request.method.toUpperCase() as "GET",
+    method: request.method.toUpperCase() as RequestMethod,
     url: parsedURL.pathname + parsedURL.search,
     path: parsedURL.pathname,
     originalUrl: parsedURL.pathname + parsedURL.search,
     baseUrl: parsedURL.origin,
-    headers: JSON.parse(JSON.stringify(request.headers)),
+    headers: headersToRecord(request.headers),
     query,
     body,
     ...options,
@@ -102,44 +117,53 @@ async function transformRequestToIncomingMessage(
 }
 
 function transformResponseToServerResponse(
-  serverResponse: MockResponse<ServerResponse>
+  serverResponse: MockResponse<ServerResponse>,
 ) {
-  // console.log("content", serverResponse._getData(), serverResponse._getBuffer());
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(serverResponse.getHeaders())) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const v of value) headers.append(key, v);
+    } else {
+      headers.set(key, String(value));
+    }
+  }
 
   return new Response(
     serverResponse._getData() || serverResponse._getBuffer(),
     {
       status: serverResponse.statusCode,
       statusText: serverResponse.statusMessage,
-      // @ts-expect-error
-      headers: serverResponse.getHeaders(),
-    }
+      headers,
+    },
   );
 }
 
+type MockResponseExtended = MockResponse<ServerResponse> & {
+  _implicitHeader?: () => void;
+};
+
 function createResponse(
   request: Express.Request,
-  resolve: (value: Response) => void
+  resolve: (value: Response) => void,
 ) {
   const response = createResponseMock({
     req: request,
-  });
+  }) as MockResponseExtended;
 
-  // @ts-expect-error
-  if (!response._implicitHeader)
-    // @ts-expect-error
+  if (!response._implicitHeader) {
     response._implicitHeader = () => {};
+  }
 
-  const end = response.end;
+  const originalEnd = response.end;
 
-  // @ts-expect-error
-  response.end = (...args: Parameters<typeof response.end>) => {
-    const call = end.call(response, ...args);
+  response.end = ((...args: Parameters<typeof originalEnd>) => {
+    const call = originalEnd.call(response, ...args);
     const webResponse = transformResponseToServerResponse(response);
     resolve(webResponse);
 
     return call;
-  };
+  }) as typeof originalEnd;
 
   return response;
 }
