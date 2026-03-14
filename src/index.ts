@@ -1,23 +1,21 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import {
-  type RequestOptions,
-  type Body as MockBody,
-  type MockRequest,
-  type MockResponse,
-  type RequestMethod,
-  type Headers as MockHeaders,
-  createRequest,
-  createResponse as createMockResponse,
-} from "node-mocks-http";
+import { EventEmitter } from "node:events";
 import Connect from "connect";
 import { Elysia } from "elysia";
 
-type ConnectServer = Connect.Server;
+export type ConnectMiddleware = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  next: (err?: any) => void,
+) => void;
 
-export type ConnectMiddleware = Connect.HandleFunction;
+interface ConnectApp {
+  use(fn: ConnectMiddleware): void;
+  handle(req: any, res: any, done: Function): void;
+}
 
 export function connect(...middlewares: ConnectMiddleware[]) {
-  const connectApp = Connect();
+  const connectApp: ConnectApp = Connect();
 
   for (const middleware of middlewares) {
     connectApp.use(middleware);
@@ -27,16 +25,13 @@ export function connect(...middlewares: ConnectMiddleware[]) {
     name: "connect",
     seed: middlewares,
   }).onRequest(async function processConnectMiddlewares({ request, set }) {
-    const message = await transformRequestToIncomingMessage(
-      connectApp,
-      request,
-    );
+    const req = await toNodeRequest(request, connectApp);
 
     return await new Promise<Response | undefined>((resolve) => {
-      const response = createResponseProxy(message, resolve);
+      const res = createNodeResponse(req, resolve);
 
-      connectApp.handle(message, response, () => {
-        const webResponse = toWebResponse(response);
+      connectApp.handle(req, res, () => {
+        const webResponse = toWebResponse(res);
 
         webResponse.headers.forEach((value, key) => {
           set.headers[key] = value;
@@ -49,68 +44,276 @@ export function connect(...middlewares: ConnectMiddleware[]) {
   });
 }
 
-function mockAppAtRequest(
-  message: MockRequest<IncomingMessage>,
-  connectApp: ConnectServer,
-) {
-  message.app = connectApp;
-
-  // Express middleware calls req.app.get('env') to read settings.
-  // Connect has no settings system, so we stub it.
-  message.app.get = (_setting: string) => false;
-
-  return message;
+function createMockSocket() {
+  return Object.assign(new EventEmitter(), {
+    destroy() {},
+    remoteAddress: "127.0.0.1",
+    writable: true,
+    encrypted: false,
+  });
 }
 
-async function transformRequestToIncomingMessage(
-  connectApp: ConnectServer,
-  request: Request,
-  options?: RequestOptions,
-): Promise<MockRequest<IncomingMessage>> {
-  const parsedURL = new URL(request.url, "http://localhost");
+async function toNodeRequest(request: Request, connectApp: ConnectApp) {
+  const parsed = new URL(request.url, "http://localhost");
 
   const query: Record<string, string> = {};
-
-  for (const [key, value] of parsedURL.searchParams.entries()) {
+  for (const [key, value] of parsed.searchParams.entries()) {
     query[key] = value;
   }
 
-  let body: MockBody | undefined;
+  const headers: Record<string, string> = {};
+  request.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
 
+  let body: unknown;
   try {
-    body = (await request.clone().json()) as MockBody;
+    body = await request.clone().json();
   } catch {
     body = undefined;
   }
 
-  const message = createRequest<IncomingMessage>({
-    method: request.method.toUpperCase() as RequestMethod,
-    url: parsedURL.pathname + parsedURL.search,
-    path: parsedURL.pathname,
-    originalUrl: parsedURL.pathname + parsedURL.search,
-    baseUrl: parsedURL.origin,
-    headers: headersToRecord(request.headers),
+  const socket = createMockSocket();
+
+  // Prototype-inherit from connectApp so middleware can call methods like
+  // req.app.handle(), while our stub shadows the missing Express .get().
+  const app = Object.create(connectApp);
+  app.get = (_setting: string) => false;
+
+  const req = Object.assign(new EventEmitter(), {
+    method: request.method.toUpperCase(),
+    url: parsed.pathname + parsed.search,
+    originalUrl: parsed.pathname + parsed.search,
+    baseUrl: parsed.origin,
+    path: parsed.pathname,
+    headers,
+    rawHeaders: Object.entries(headers).flat(),
     query,
     body,
-    ...options,
+    params: {},
+    httpVersion: "1.1",
+    httpVersionMajor: 1,
+    httpVersionMinor: 1,
+    complete: true,
+    readable: true,
+    aborted: false,
+    socket,
+    connection: socket,
+    app,
+
+    getHeader(name: string) {
+      return headers[name.toLowerCase()];
+    },
+    get(name: string) {
+      return headers[name.toLowerCase()];
+    },
+    unpipe() {
+      return req;
+    },
+    resume() {
+      return req;
+    },
+    pause() {
+      return req;
+    },
+    destroy() {},
+    setTimeout(_ms: number, _cb?: () => void) {
+      return req;
+    },
   });
 
-  return mockAppAtRequest(message, connectApp);
+  return req;
 }
 
-function headersToRecord(headers: Headers): MockHeaders {
-  const result: Record<string, string> = {};
-  headers.forEach((value, key) => {
-    result[key] = value;
+function concatChunks(chunks: Uint8Array[]): ArrayBuffer {
+  const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+  if (totalLength === 0) return new ArrayBuffer(0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result.buffer;
+}
+
+function createNodeResponse(
+  req: { socket: ReturnType<typeof createMockSocket> },
+  resolvePromise: (value: Response) => void,
+) {
+  const headers: Record<string, string | number | string[]> = {};
+  let data = "";
+  const chunks: Uint8Array[] = [];
+  let endCalled = false;
+
+  const res = Object.assign(new EventEmitter(), {
+    statusCode: 200,
+    statusMessage: "OK",
+    headersSent: false,
+    finished: false,
+    writableEnded: false,
+    writableFinished: false,
+    writable: true,
+    req,
+    socket: req.socket,
+
+    _implicitHeader() {},
+    flushHeaders() {},
+    cork() {},
+    uncork() {},
+
+    setHeader(name: string, value: string | number | string[]) {
+      headers[name.toLowerCase()] = value;
+      return res;
+    },
+
+    getHeader(name: string) {
+      return headers[name.toLowerCase()];
+    },
+
+    getHeaders(): Record<string, string | number | string[] | undefined> {
+      return { ...headers };
+    },
+
+    getHeaderNames() {
+      return Object.keys(headers);
+    },
+
+    hasHeader(name: string) {
+      return name.toLowerCase() in headers;
+    },
+
+    removeHeader(name: string) {
+      delete headers[name.toLowerCase()];
+    },
+
+    appendHeader(name: string, value: string | string[]) {
+      const key = name.toLowerCase();
+      const existing = headers[key];
+      if (existing === undefined) {
+        headers[key] = value;
+      } else if (Array.isArray(existing)) {
+        headers[key] = existing.concat(value);
+      } else {
+        headers[key] = [String(existing)].concat(value);
+      }
+      return res;
+    },
+
+    writeHead(
+      statusCode: number,
+      statusMessageOrHeaders?:
+        | string
+        | Record<string, string | number | string[]>,
+      maybeHeaders?: Record<string, string | number | string[]>,
+    ) {
+      res.statusCode = statusCode;
+      let hdrs: Record<string, string | number | string[]> | undefined;
+
+      if (typeof statusMessageOrHeaders === "string") {
+        res.statusMessage = statusMessageOrHeaders;
+        hdrs = maybeHeaders;
+      } else if (typeof statusMessageOrHeaders === "object") {
+        hdrs = statusMessageOrHeaders;
+      }
+
+      if (hdrs) {
+        for (const [k, v] of Object.entries(hdrs)) {
+          res.setHeader(k, v);
+        }
+      }
+
+      res.headersSent = true;
+      return res;
+    },
+
+    write(
+      chunk: string | Uint8Array,
+      encodingOrCallback?: string | (() => void),
+      callback?: () => void,
+    ) {
+      res.headersSent = true;
+
+      if (typeof chunk === "string") {
+        data += chunk;
+      } else {
+        chunks.push(chunk);
+      }
+
+      const cb =
+        typeof encodingOrCallback === "function"
+          ? encodingOrCallback
+          : callback;
+      if (cb) cb();
+
+      return true;
+    },
+
+    end(
+      chunkOrCallback?: string | Uint8Array | (() => void),
+      encodingOrCallback?: string | (() => void),
+      callback?: () => void,
+    ) {
+      if (endCalled) return res;
+      endCalled = true;
+
+      let chunk: string | Uint8Array | undefined;
+      let cb: (() => void) | undefined;
+
+      if (typeof chunkOrCallback === "function") {
+        cb = chunkOrCallback;
+      } else {
+        chunk = chunkOrCallback;
+        cb =
+          typeof encodingOrCallback === "function"
+            ? encodingOrCallback
+            : callback;
+      }
+
+      if (chunk != null) {
+        if (typeof chunk === "string") {
+          data += chunk;
+        } else {
+          chunks.push(chunk);
+        }
+      }
+
+      res.finished = true;
+      res.writableEnded = true;
+      res.headersSent = true;
+
+      res.emit("end");
+      res.writableFinished = true;
+      res.emit("finish");
+
+      if (cb) cb();
+
+      resolvePromise(toWebResponse(res));
+
+      return res;
+    },
+
+    getData() {
+      return data;
+    },
+
+    getBuffer(): ArrayBuffer {
+      return concatChunks(chunks);
+    },
+
+    setTimeout(_ms: number, _cb?: () => void) {
+      return res;
+    },
   });
-  return result as MockHeaders;
+
+  return res;
 }
 
-function toWebResponse(
-  mockResponse: MockResponse<ServerResponse>,
-): Response {
+type NodeResponse = ReturnType<typeof createNodeResponse>;
+
+function toWebResponse(res: NodeResponse): Response {
   const headers = new Headers();
-  const rawHeaders = mockResponse.getHeaders();
+  const rawHeaders = res.getHeaders();
 
   for (const [key, value] of Object.entries(rawHeaders)) {
     if (value === undefined) continue;
@@ -121,45 +324,10 @@ function toWebResponse(
     }
   }
 
-  return new Response(
-    mockResponse._getData() || mockResponse._getBuffer(),
-    {
-      status: mockResponse.statusCode,
-      statusText: mockResponse.statusMessage,
-      headers,
-    },
-  );
-}
-
-interface NodeResponseInternals {
-  _implicitHeader?: () => void;
-}
-
-function createResponseProxy(
-  request: MockRequest<IncomingMessage>,
-  resolve: (value: Response) => void,
-): MockResponse<ServerResponse> {
-  const response = createMockResponse<ServerResponse>({
-    req: request,
+  const body = res.getData() || res.getBuffer();
+  return new Response(body, {
+    status: res.statusCode,
+    statusText: res.statusMessage,
+    headers,
   });
-
-  // Some middleware (e.g. compression) calls Node's internal _implicitHeader.
-  const withInternals = response as MockResponse<ServerResponse> &
-    NodeResponseInternals;
-  if (!withInternals._implicitHeader) {
-    withInternals._implicitHeader = () => {};
-  }
-
-  const originalEnd = response.end;
-
-  // Wrap end() to intercept the completed response and resolve the promise.
-  // ServerResponse.end() has multiple overloaded signatures that can't be
-  // represented by a single implementation, so a type assertion is needed.
-  response.end = ((...args: unknown[]) => {
-    const result = (originalEnd as Function).apply(response, args);
-    resolve(toWebResponse(response));
-    return result;
-  }) as typeof response.end;
-
-  return response;
 }
