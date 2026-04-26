@@ -1,50 +1,92 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
-import { EventEmitter } from "node:events";
+import type { IncomingMessage } from "node:http";
+import { ServerResponse } from "node:http";
+import { PassThrough, Readable } from "node:stream";
 import { Elysia } from "elysia";
 
 export type ConnectMiddleware = (
   req: IncomingMessage,
   res: ServerResponse,
-  next: (err?: any) => void,
+  next: (err?: unknown) => void,
 ) => void;
 
+const STATUS_CODES_WITHOUT_BODY = new Set([100, 101, 102, 103, 204, 205, 304]);
+
+/**
+ * Elysia plugin that runs Connect-style middleware (e.g. `vite.middlewares`)
+ * in the `onRequest` hook. Streams responses instead of buffering.
+ *
+ * Returns `undefined` when middleware calls `next()` without handling the
+ * request, so Elysia continues to its own routes.
+ */
 export function connect(...middlewares: ConnectMiddleware[]) {
   return new Elysia({
     name: "connect",
     seed: middlewares,
-  }).onRequest(async function processConnectMiddlewares({ request, set }) {
-    const req = await toNodeRequest(request);
+  }).onRequest(async ({ request, set }) => {
+    const req = createIncomingMessage(request);
+    const { res, onReadable } = createStreamingResponse(req);
 
-    return await new Promise<Response | undefined>((resolve) => {
-      const res = createNodeResponse(req, resolve);
+    return new Promise<Response | undefined>((resolve, reject) => {
+      (async () => {
+        try {
+          const { readable, headers, statusCode } = await onReadable;
 
-      runMiddleware(middlewares, req, res, () => {
-        const webResponse = toWebResponse(res);
+          const responseHeaders = flattenHeaders(headers);
+          responseHeaders.forEach((value, key) => {
+            set.headers[key] = value;
+          });
+          set.status = statusCode;
 
-        webResponse.headers.forEach((value, key) => {
-          set.headers[key] = value;
-        });
-        set.status = webResponse.status;
+          const body = STATUS_CODES_WITHOUT_BODY.has(statusCode)
+            ? null
+            : (Readable.toWeb(readable) as unknown as ReadableStream);
 
-        resolve(undefined);
+          resolve(
+            new Response(body, {
+              status: statusCode,
+              headers: responseHeaders,
+            }),
+          );
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error("Error creating response"));
+        }
+      })();
+
+      const next = (err?: unknown) => {
+        if (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        } else {
+          resolve(undefined);
+        }
+      };
+
+      try {
+        runMiddleware(middlewares, req, res, next);
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+
+      request.signal.addEventListener("abort", () => resolve(undefined), {
+        once: true,
       });
     });
   });
 }
 
-// Minimal connect-compatible middleware runner. Walks the stack calling next()
-// to advance; dispatches error handlers (arity 4) when an error is present,
-// skips normal handlers in that case, and vice-versa.
+/**
+ * Walks a Connect middleware stack. Error handlers (arity >= 4) only run
+ * when an error is present; normal handlers are skipped in that case.
+ */
 function runMiddleware(
-  stack: ((...args: any[]) => void)[],
-  req: unknown,
-  res: unknown,
+  stack: ConnectMiddleware[],
+  req: IncomingMessage,
+  res: ServerResponse,
   done: (err?: unknown) => void,
 ) {
   let index = 0;
 
   function next(err?: unknown) {
-    const handle = stack[index++];
+    const handle = stack[index++] as ((...args: unknown[]) => void) | undefined;
     if (!handle) {
       done(err);
       return;
@@ -52,17 +94,11 @@ function runMiddleware(
 
     try {
       if (err) {
-        if (handle.length >= 4) {
-          handle(err, req, res, next);
-        } else {
-          next(err);
-        }
+        if (handle.length >= 4) handle(err, req, res, next);
+        else next(err);
       } else {
-        if (handle.length < 4) {
-          handle(req, res, next);
-        } else {
-          next();
-        }
+        if (handle.length < 4) handle(req, res, next);
+        else next();
       }
     } catch (e) {
       next(e);
@@ -72,275 +108,94 @@ function runMiddleware(
   next();
 }
 
-function createMockSocket() {
-  return Object.assign(new EventEmitter(), {
-    destroy() {},
-    remoteAddress: "127.0.0.1",
-    writable: true,
-    encrypted: false,
-  });
+/**
+ * Convert a web `Request` into a Node.js `IncomingMessage`-like `Readable`.
+ * Body is streamed lazily — Vite middleware rarely reads it.
+ */
+function createIncomingMessage(request: Request): IncomingMessage {
+  const url = new URL(request.url);
+  const pathnameAndQuery = (url.pathname || "") + (url.search || "");
+
+  const body = request.body
+    ? Readable.fromWeb(request.body as unknown as import("node:stream/web").ReadableStream)
+    : Readable.from([]);
+
+  return Object.assign(body, {
+    url: pathnameAndQuery,
+    originalUrl: pathnameAndQuery,
+    method: request.method,
+    headers: Object.fromEntries(request.headers),
+  }) as unknown as IncomingMessage;
 }
 
-async function toNodeRequest(request: Request) {
-  const parsed = new URL(request.url, "http://localhost");
+/**
+ * Creates a real `ServerResponse` wired to a `PassThrough` stream.
+ * The returned `onReadable` promise resolves once the middleware starts
+ * writing, giving you a `Readable` you can pipe through `Readable.toWeb()`.
+ */
+function createStreamingResponse(incomingMessage: IncomingMessage) {
+  const res = new ServerResponse(incomingMessage);
+  const passThrough = new PassThrough();
 
-  const query: Record<string, string> = {};
-  for (const [key, value] of parsed.searchParams.entries()) {
-    query[key] = value;
-  }
-
-  const headers: Record<string, string> = {};
-  request.headers.forEach((value, key) => {
-    headers[key] = value;
+  const onReadable = new Promise<{
+    readable: Readable;
+    headers: ReturnType<ServerResponse["getHeaders"]>;
+    statusCode: number;
+  }>((resolve, reject) => {
+    passThrough.once("readable", () => {
+      resolve({
+        readable: Readable.from(passThrough),
+        headers: res.getHeaders(),
+        statusCode: res.statusCode,
+      });
+    });
+    passThrough.once("error", reject);
   });
 
-  let body: unknown;
-  try {
-    body = await request.clone().json();
-  } catch {
-    body = undefined;
-  }
+  res.once("finish", () => passThrough.end());
+  passThrough.on("drain", () => res.emit("drain"));
 
-  const socket = createMockSocket();
+  // Redirect writes through the PassThrough stream
+  res.write = passThrough.write.bind(passThrough) as unknown as typeof res.write;
+  res.end = passThrough.end.bind(passThrough) as unknown as typeof res.end;
 
-  // Express middleware calls req.app.get('env') to read settings.
-  // Connect has no settings system, so we stub it.
-  const app = { get: () => false };
+  let headersSet = false;
+  const originalWriteHead = res.writeHead;
+  res.writeHead = function writeHead(
+    statusCode: number,
+    statusMessage?: string | Record<string, string | number | readonly string[] | undefined>,
+    headers?: Record<string, string | number | readonly string[] | undefined>,
+  ) {
+    if (headersSet) return res;
+    headersSet = true;
+    res.statusCode = statusCode;
 
-  return Object.assign(new EventEmitter(), {
-    method: request.method.toUpperCase(),
-    url: parsed.pathname + parsed.search,
-    originalUrl: parsed.pathname + parsed.search,
-    baseUrl: parsed.origin,
-    path: parsed.pathname,
-    headers,
-    rawHeaders: Object.entries(headers).flat(),
-    query,
-    body,
-    params: {},
-    httpVersion: "1.1",
-    httpVersionMajor: 1,
-    httpVersionMinor: 1,
-    complete: true,
-    readable: true,
-    aborted: false,
-    socket,
-    connection: socket,
-    app,
+    if (typeof statusMessage === "object") {
+      headers = statusMessage;
+      statusMessage = undefined;
+    }
 
-    getHeader(name: string) {
-      return headers[name.toLowerCase()];
-    },
-    get(name: string) {
-      return headers[name.toLowerCase()];
-    },
-    unpipe() {
-      return this;
-    },
-    resume() {
-      return this;
-    },
-    pause() {
-      return this;
-    },
-    destroy() {},
-    setTimeout(_ms: number, _cb?: () => void) {
-      return this;
-    },
-  });
+    if (headers) {
+      for (const [key, value] of Object.entries(headers)) {
+        if (value !== undefined) res.setHeader(key, value);
+      }
+    }
+
+    return res;
+  } as typeof originalWriteHead;
+
+  return { res, onReadable };
 }
 
-function concatChunks(chunks: Uint8Array[]): ArrayBuffer {
-  const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-  if (totalLength === 0) return new ArrayBuffer(0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result.buffer;
-}
-
-function createNodeResponse(
-  req: { socket: ReturnType<typeof createMockSocket> },
-  resolvePromise: (value: Response) => void,
-) {
-  const headers: Record<string, string | number | string[]> = {};
-  let data = "";
-  const chunks: Uint8Array[] = [];
-  let endCalled = false;
-
-  const res = Object.assign(new EventEmitter(), {
-    statusCode: 200,
-    statusMessage: "OK",
-    headersSent: false,
-    finished: false,
-    writableEnded: false,
-    writableFinished: false,
-    writable: true,
-    req,
-    socket: req.socket,
-
-    _implicitHeader() {},
-    flushHeaders() {},
-    cork() {},
-    uncork() {},
-
-    setHeader(name: string, value: string | number | string[]) {
-      headers[name.toLowerCase()] = value;
-      return res;
-    },
-
-    getHeader(name: string) {
-      return headers[name.toLowerCase()];
-    },
-
-    getHeaders(): Record<string, string | number | string[] | undefined> {
-      return { ...headers };
-    },
-
-    getHeaderNames() {
-      return Object.keys(headers);
-    },
-
-    hasHeader(name: string) {
-      return name.toLowerCase() in headers;
-    },
-
-    removeHeader(name: string) {
-      delete headers[name.toLowerCase()];
-    },
-
-    appendHeader(name: string, value: string | string[]) {
-      const key = name.toLowerCase();
-      const existing = headers[key];
-      if (existing === undefined) {
-        headers[key] = value;
-      } else if (Array.isArray(existing)) {
-        headers[key] = existing.concat(value);
-      } else {
-        headers[key] = [String(existing)].concat(value);
-      }
-      return res;
-    },
-
-    writeHead(
-      statusCode: number,
-      statusMessageOrHeaders?:
-        | string
-        | Record<string, string | number | string[]>,
-      maybeHeaders?: Record<string, string | number | string[]>,
-    ) {
-      res.statusCode = statusCode;
-      let hdrs: Record<string, string | number | string[]> | undefined;
-
-      if (typeof statusMessageOrHeaders === "string") {
-        res.statusMessage = statusMessageOrHeaders;
-        hdrs = maybeHeaders;
-      } else if (typeof statusMessageOrHeaders === "object") {
-        hdrs = statusMessageOrHeaders;
-      }
-
-      if (hdrs) {
-        for (const [k, v] of Object.entries(hdrs)) {
-          res.setHeader(k, v);
-        }
-      }
-
-      res.headersSent = true;
-      return res;
-    },
-
-    write(
-      chunk: string | Uint8Array,
-      encodingOrCallback?: string | (() => void),
-      callback?: () => void,
-    ) {
-      res.headersSent = true;
-
-      if (typeof chunk === "string") {
-        data += chunk;
-      } else {
-        chunks.push(chunk);
-      }
-
-      const cb =
-        typeof encodingOrCallback === "function"
-          ? encodingOrCallback
-          : callback;
-      if (cb) cb();
-
-      return true;
-    },
-
-    end(
-      chunkOrCallback?: string | Uint8Array | (() => void),
-      encodingOrCallback?: string | (() => void),
-      callback?: () => void,
-    ) {
-      if (endCalled) return res;
-      endCalled = true;
-
-      let chunk: string | Uint8Array | undefined;
-      let cb: (() => void) | undefined;
-
-      if (typeof chunkOrCallback === "function") {
-        cb = chunkOrCallback;
-      } else {
-        chunk = chunkOrCallback;
-        cb =
-          typeof encodingOrCallback === "function"
-            ? encodingOrCallback
-            : callback;
-      }
-
-      if (chunk != null) {
-        if (typeof chunk === "string") {
-          data += chunk;
-        } else {
-          chunks.push(chunk);
-        }
-      }
-
-      res.finished = true;
-      res.writableEnded = true;
-      res.headersSent = true;
-
-      res.emit("end");
-      res.writableFinished = true;
-      res.emit("finish");
-
-      if (cb) cb();
-
-      resolvePromise(toWebResponse(res));
-
-      return res;
-    },
-
-    getData() {
-      return data;
-    },
-
-    getBuffer(): ArrayBuffer {
-      return concatChunks(chunks);
-    },
-
-    setTimeout(_ms: number, _cb?: () => void) {
-      return res;
-    },
-  });
-
-  return res;
-}
-
-type NodeResponse = ReturnType<typeof createNodeResponse>;
-
-function toWebResponse(res: NodeResponse): Response {
+/**
+ * Flatten `OutgoingHttpHeaders` into a `Headers` object.
+ * Handles arrays (e.g. `set-cookie`) by appending.
+ */
+function flattenHeaders(
+  raw: Record<string, string | number | readonly string[] | undefined>,
+): Headers {
   const headers = new Headers();
-  const rawHeaders = res.getHeaders();
-
-  for (const [key, value] of Object.entries(rawHeaders)) {
+  for (const [key, value] of Object.entries(raw)) {
     if (value === undefined) continue;
     if (Array.isArray(value)) {
       for (const v of value) headers.append(key, v);
@@ -348,11 +203,5 @@ function toWebResponse(res: NodeResponse): Response {
       headers.set(key, String(value));
     }
   }
-
-  const body = res.getData() || res.getBuffer();
-  return new Response(body, {
-    status: res.statusCode,
-    statusText: res.statusMessage,
-    headers,
-  });
+  return headers;
 }

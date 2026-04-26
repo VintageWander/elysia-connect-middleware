@@ -1,13 +1,13 @@
 {
   "name": "elysia-connect-middleware",
   "version": "0.0.0",
+  "type": "module",
   "module": "./src/index.ts",
   "types": "./src/index.ts",
-  "type": "module",
-  "peerDependencies": {
-    "elysia": "^1.4.18"
-  },
   "devDependencies": {
     "@types/bun": "^1.3.10"
+  },
+  "peerDependencies": {
+    "elysia": "^1.4.18"
   }
 }
