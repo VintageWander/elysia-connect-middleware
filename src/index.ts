@@ -116,8 +116,9 @@ function createIncomingMessage(request: Request): IncomingMessage {
   const url = new URL(request.url);
   const pathnameAndQuery = (url.pathname || "") + (url.search || "");
 
-  const body = request.body
-    ? Readable.fromWeb(request.body as unknown as import("node:stream/web").ReadableStream)
+  const cloned = request.clone();
+  const body = cloned.body
+    ? Readable.fromWeb(cloned.body as unknown as import("node:stream/web").ReadableStream)
     : Readable.from([]);
 
   return Object.assign(body, {
